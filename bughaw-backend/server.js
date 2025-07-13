@@ -1,24 +1,9 @@
 /*
 ================================================================================
--- BUGHWAW MULTI-LINE CORP - BACKEND API (FINAL PRODUCTION) --
-This is the final, production-ready backend server. It provides all APIs for
-the web admin panel and the agent mobile app.
-
-Features & Fixes:
-- Endpoints for sales summary, orders, and inventory are now fully functional.
-- Implemented full CRUD (Create, Read, Update, Delete) logic for all modules.
-- Advanced User Management:
-  - Add users with specific roles (Admin, Agent).
-  - Edit user roles and permissions (e.g., 'pos', 'dashboard').
-  - Securely change user passwords.
-- Secure authentication with JWT.
-- Role-based and permission-based access control.
-- Transactional order processing to ensure data integrity.
-- Image upload handling for products.
-- Automatic setup for default users on first run.
-- Added robust error handling for JSON parsing in the login route.
-- FIXED: Improved permissions parsing to handle edge cases and invalid JSON
+-- BUGHWAW MULTI-LINE CORP - BACKEND API (V12.2 - HIERARCHICAL PERMISSIONS) --
 ================================================================================
+This is the final, complete server code with the new "Sub-Admin" role,
+granular per-user permissions, and a hierarchical user management system.
 */
 
 const express = require('express');
@@ -31,31 +16,29 @@ const path = require('path');
 const fs = require('fs');
 
 // --- CONFIGURATION ---
+require('dotenv').config();
 const app = express();
-const port = 5000;
+const port = process.env.PORT || 5000;
 const saltRounds = 10;
-const JWT_SECRET = 'a-very-secure-and-complex-secret-key-for-bughaw-should-be-in-an-env-file';
+const JWT_SECRET = process.env.JWT_SECRET;
 
-// --- DATABASE CONNECTION ---
 const db = mysql.createPool({
-    host: 'localhost',
-    user: 'root',
-    password: 'canaman15', // IMPORTANT: Replace with your MySQL password
-    database: 'bughaw_db',
+    host: process.env.DB_HOST,
+    user: process.env.DB_USER,
+    password: process.env.DB_PASSWORD,
+    database: process.env.DB_NAME,
     waitForConnections: true,
-    connectionLimit: 10,
+    connectionLimit: 15,
     queueLimit: 0,
-    dateStrings: true
+    dateStrings: true,
+    timezone: '+08:00'
 }).promise();
 
-// --- MIDDLEWARE & SETUP ---
 app.use(cors());
 app.use(express.json());
 
 const uploadsDir = path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadsDir)) {
-    fs.mkdirSync(uploadsDir);
-}
+if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir);
 app.use('/uploads', express.static(uploadsDir));
 
 const storage = multer.diskStorage({
@@ -65,648 +48,828 @@ const storage = multer.diskStorage({
         cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
     }
 });
-const upload = multer({ storage: storage });
-
-// --- HELPER FUNCTION FOR PERMISSIONS PARSING ---
-const parsePermissions = (permissionsData) => {
-    if (!permissionsData) {
-        return [];
-    }
-    
-    // If it's already an array, return it
-    if (Array.isArray(permissionsData)) {
-        return permissionsData;
-    }
-    
-    // Handle string values
-    if (typeof permissionsData === 'string') {
-        // Handle special cases like "all"
-        if (permissionsData.toLowerCase() === 'all') {
-            return ['pos', 'dashboard', 'products', 'inventory', 'orders'];
-        }
-        
-        // Try to parse as JSON
-        try {
-            const parsed = JSON.parse(permissionsData);
-            return Array.isArray(parsed) ? parsed : [];
-        } catch (e) {
-            console.error(`Invalid permissions data: "${permissionsData}". Setting to empty array.`);
-            return [];
-        }
-    }
-    
-    // Default fallback
-    return [];
-};
+const upload = multer({ storage: storage, limits: { fileSize: 5 * 1024 * 1024 } });
 
 // --- AUTH MIDDLEWARE ---
 const verifyToken = (req, res, next) => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
-    if (token == null) return res.status(401).json({ message: "Unauthorized: No token provided." });
+    if (!token) return res.status(401).json({ message: "Unauthorized: No token provided." });
 
     jwt.verify(token, JWT_SECRET, (err, user) => {
-        if (err) return res.status(403).json({ message: "Forbidden: Invalid or expired token." });
+        if (err) {
+            if (err.name === 'TokenExpiredError') return res.status(401).json({ message: 'Token expired. Please log in again.' });
+            return res.status(403).json({ message: "Forbidden: Invalid token." });
+        }
         req.user = user;
         next();
     });
 };
 
-const hasPermission = (requiredPermissions) => (req, res, next) => {
-    const user = req.user;
-    if (user.role === 'Super Admin') {
-        return next();
-    }
-    if (user.permissions && requiredPermissions.some(p => user.permissions.includes(p))) {
-        return next();
-    }
-    return res.status(403).json({ message: "Forbidden: You do not have permission to perform this action." });
-};
+const hasPermission = (requiredPermissions) => async (req, res, next) => {
+    const userPermissions = req.user.permissions || [];
+    const permsToCheck = Array.isArray(requiredPermissions) ? requiredPermissions : [requiredPermissions];
+    const hasAtLeastOnePerm = permsToCheck.some(p => userPermissions.includes(p));
 
-const isSuperAdmin = (req, res, next) => {
-    if (req.user.role !== 'Super Admin') {
-        return res.status(403).json({ message: "Forbidden: Super Admin access required." });
+    if (hasAtLeastOnePerm) {
+        next();
+    } else {
+        return res.status(403).json({ message: `Forbidden: Missing required permission: ${permsToCheck.join(', ')}` });
     }
-    next();
 };
 
 // ================================================================================
 // --- API ROUTES ---
 // ================================================================================
 
-// POST /api/login
+// ## AUTHENTICATION ##
 app.post('/api/login', async (req, res) => {
     const { username, password } = req.body;
     if (!username || !password) return res.status(400).json({ message: 'Username and password are required.' });
-    
     try {
-        const [users] = await db.query('SELECT * FROM users WHERE username = ?', [username]);
-        if (users.length === 0) return res.status(401).json({ message: 'Invalid credentials.' });
+        const userQuery = `SELECT u.*, b.name as branch_name, b.is_main_branch FROM users u LEFT JOIN branches b ON u.branch_id = b.id WHERE u.username = ? AND u.is_active = TRUE`;
+        const [users] = await db.query(userQuery, [username]);
+        if (users.length === 0) return res.status(401).json({ message: 'Invalid credentials or account is disabled.' });
 
         const user = users[0];
-        const isMatch = await bcrypt.compare(password, user.password);
-        if (!isMatch) return res.status(401).json({ message: 'Invalid credentials.' });
+        const isPasswordMatch = await bcrypt.compare(password, user.password);
+        if (!isPasswordMatch) return res.status(401).json({ message: 'Invalid credentials.' });
 
-        // FIXED: Use the helper function to safely parse permissions
-        const permissions = parsePermissions(user.permissions);
+        const rolePermsQuery = `SELECT p.name as permission_name FROM user_roles ur JOIN role_permissions rp ON ur.role_id = rp.role_id JOIN permissions p ON rp.permission_id = p.id WHERE ur.user_id = ?`;
+        const [rolePermissions] = await db.query(rolePermsQuery, [user.id]);
+        
+        const specificPermsQuery = `SELECT p.name as permission_name FROM user_specific_permissions usp JOIN permissions p ON usp.permission_id = p.id WHERE usp.user_id = ?`;
+        const [specificPermissions] = await db.query(specificPermsQuery, [user.id]);
 
-        const tokenPayload = { id: user.id, username: user.username, role: user.role, permissions };
-        const token = jwt.sign(tokenPayload, JWT_SECRET, { expiresIn: '1d' });
+        const allPermissions = new Set([
+            ...rolePermissions.map(p => p.permission_name),
+            ...specificPermissions.map(p => p.permission_name)
+        ]);
+        
+        const [roles] = await db.query(`SELECT r.name as role_name FROM user_roles ur JOIN roles r ON ur.role_id = r.id WHERE ur.user_id = ?`, [user.id]);
 
-        res.json({ token, user: tokenPayload });
+        const userPayload = {
+            id: user.id,
+            username: user.username,
+            role: roles.length > 0 ? roles[0].role_name : 'No Role',
+            branch_id: user.branch_id,
+            branch_name: user.branch_name || 'All Branches',
+            is_main_branch: user.is_main_branch || false,
+            permissions: [...allPermissions]
+        };
+        const token = jwt.sign(userPayload, JWT_SECRET, { expiresIn: '8h' });
+        res.json({ token, user: userPayload });
     } catch (error) {
-        console.error("Login Server Error:", error);
-        if (error.code === 'ECONNREFUSED' || error.code === 'ER_ACCESS_DENIED_ERROR') {
-             return res.status(500).json({ message: 'Database connection failed. Please check server credentials.' });
-        }
-        res.status(500).json({ message: 'Server error during login.' });
+        console.error("Login Error:", error);
+        res.status(500).json({ message: 'Server error during login process.' });
     }
 });
 
-// --- USER MANAGEMENT ---
-app.get('/api/users', verifyToken, isSuperAdmin, async (req, res) => {
+// ## BRANCH MANAGEMENT ##
+app.get('/api/branches', verifyToken, hasPermission('manage_users'), async (req, res) => {
     try {
-        const [users] = await db.query("SELECT id, username, role, permissions FROM users WHERE role != 'Super Admin'");
-        res.json(users.map(u => ({
-            ...u, 
-            permissions: parsePermissions(u.permissions)
-        })));
-    } catch (error) { 
-        console.error("Fetch Users Error:", error);
-        res.status(500).json({ message: 'Failed to fetch users.' }); 
-    }
-});
-
-app.post('/api/users/register', verifyToken, isSuperAdmin, async (req, res) => {
-    const { username, password, role } = req.body;
-    if (!username || !password || !role) return res.status(400).json({ message: 'Username, password, and role are required.' });
-    
-    let defaultPermissions = [];
-    if (role === 'Agent') {
-        defaultPermissions = ['pos'];
-    } else if (role === 'Admin') {
-        defaultPermissions = ['pos', 'dashboard', 'products', 'inventory', 'orders'];
-    }
-    
-    try {
-        const hashedPassword = await bcrypt.hash(password, saltRounds);
-        await db.query(
-            'INSERT INTO users (username, password, role, permissions) VALUES (?, ?, ?, ?)',
-            [username, hashedPassword, role, JSON.stringify(defaultPermissions)]
-        );
-        res.status(201).json({ message: 'User created successfully.' });
-    } catch (error) { 
-        console.error("Create User Error:", error);
-        if (error.code === 'ER_DUP_ENTRY') {
-            res.status(400).json({ message: 'Username already exists.' });
-        } else {
-            res.status(500).json({ message: 'Failed to create user.' });
-        }
-    }
-});
-
-app.put('/api/users/:id', verifyToken, isSuperAdmin, async (req, res) => {
-    const { id } = req.params;
-    const { role, permissions } = req.body;
-    if (!role || !permissions) {
-        return res.status(400).json({ message: "Role and permissions are required." });
-    }
-    try {
-        await db.query(
-            'UPDATE users SET role = ?, permissions = ? WHERE id = ?',
-            [role, JSON.stringify(permissions || []), id]
-        );
-        res.json({ message: 'User updated successfully.' });
-    } catch (error) { 
-        console.error("Update User Error:", error);
-        res.status(500).json({ message: 'Failed to update user.' }); 
-    }
-});
-
-app.delete('/api/users/:id', verifyToken, isSuperAdmin, async (req, res) => {
-    const { id } = req.params;
-    try {
-        await db.query('DELETE FROM users WHERE id = ?', [id]);
-        res.json({ message: 'User deleted successfully.' });
+        const [branches] = await db.query('SELECT * FROM branches ORDER BY name');
+        res.json(branches);
     } catch (error) {
-        console.error("Delete User Error:", error);
-        res.status(500).json({ message: 'Failed to delete user.' });
+        console.error("Error fetching branches:", error);
+        res.status(500).json({ message: "Failed to fetch branches." });
     }
 });
 
-app.put('/api/users/change-password', verifyToken, async (req, res) => {
-    const { currentPassword, newPassword } = req.body;
-    const userId = req.user.id;
-    if (!currentPassword || !newPassword) return res.status(400).json({ message: "All password fields are required."});
-
-    try {
-        const [users] = await db.query('SELECT password FROM users WHERE id = ?', [userId]);
-        if (users.length === 0) return res.status(404).json({ message: 'User not found.' });
-
-        const isMatch = await bcrypt.compare(currentPassword, users[0].password);
-        if (!isMatch) return res.status(400).json({ message: 'Incorrect current password.' });
-
-        const hashedNewPassword = await bcrypt.hash(newPassword, saltRounds);
-        await db.query('UPDATE users SET password = ? WHERE id = ?', [hashedNewPassword, userId]);
-        res.json({ message: 'Password changed successfully.' });
-    } catch (error) { 
-        console.error("Change Password Error:", error);
-        res.status(500).json({ message: 'Server error changing password.' }); 
-    }
-});
-
-// --- PRODUCT ROUTES ---
-app.get('/api/products', verifyToken, async (req, res) => {
-    try {
-        const query = `
-            SELECT p.id, p.name, p.description, p.price, p.image_url, COALESCE(i.stock_quantity, 0) as stock
-            FROM products p
-            LEFT JOIN inventory i ON p.id = i.product_id
-            ORDER BY p.name;
-        `;
-        const [products] = await db.query(query);
-        res.json(products.map(p => ({...p, price: parseFloat(p.price) })));
-    } catch (error) {
-        console.error("Fetch Products Error:", error);
-        res.status(500).json({ message: "Failed to fetch products" });
-    }
-});
-
-app.post('/api/products', verifyToken, hasPermission(['products']), upload.single('image'), async (req, res) => {
-    const { name, description, price } = req.body;
-    if (!name || !price) return res.status(400).json({ message: 'Name and price are required.' });
-    
-    const imageUrl = req.file ? `/uploads/${req.file.filename}` : null;
-    
+app.post('/api/branches', verifyToken, hasPermission('manage_branches'), async (req, res) => {
+    const { name, is_main_branch } = req.body;
+    if (!name || name.trim() === '') return res.status(400).json({ message: 'Branch name is required.' });
     const connection = await db.getConnection();
     try {
         await connection.beginTransaction();
-        
-        const [productResult] = await connection.query(
-            'INSERT INTO products (name, description, price, image_url) VALUES (?, ?, ?, ?)',
-            [name, description || '', parseFloat(price), imageUrl]
-        );
-        
-        const productId = productResult.insertId;
-        
-        await connection.query(
-            'INSERT INTO inventory (product_id, stock_quantity) VALUES (?, ?)',
-            [productId, 0]
-        );
-        
+        if (is_main_branch) await connection.query('UPDATE branches SET is_main_branch = FALSE WHERE is_main_branch = TRUE');
+        await connection.query('INSERT INTO branches (name, is_main_branch) VALUES (?, ?)', [name.trim(), is_main_branch || false]);
         await connection.commit();
-        res.status(201).json({ message: 'Product created successfully.', productId });
+        res.status(201).json({ message: 'Branch created successfully.' });
     } catch (error) {
         await connection.rollback();
-        console.error("Create Product Error:", error);
+        if (error.code === 'ER_DUP_ENTRY') return res.status(409).json({ message: 'A branch with this name already exists.' });
+        res.status(500).json({ message: 'Failed to create branch.' });
+    } finally {
+        connection.release();
+    }
+});
+
+// ## USER MANAGEMENT ##
+app.get('/api/users', verifyToken, hasPermission('manage_users'), async (req, res) => {
+    const requestingUser = req.user;
+    let query = `
+        SELECT u.id, u.username, u.branch_id, b.name as branch_name, r.name as role, u.is_active
+        FROM users u
+        LEFT JOIN branches b ON u.branch_id = b.id
+        LEFT JOIN user_roles ur ON u.id = ur.user_id
+        LEFT JOIN roles r ON ur.role_id = r.id
+        WHERE (r.name != 'Super Admin' OR r.name IS NULL)
+    `;
+    const queryParams = [];
+
+    if (requestingUser.role === 'Admin') {
+        query += ' AND u.created_by = ?';
+        queryParams.push(requestingUser.id);
+    }
+    
+    const [users] = await db.query(query, queryParams);
+    res.json(users);
+});
+
+app.post('/api/users/register', verifyToken, hasPermission('manage_users'), async (req, res) => {
+    const { username, password, role_id, branch_id, permissions } = req.body;
+    if (!username || !password || !role_id) return res.status(400).json({ message: 'Username, password, and role are required.' });
+    
+    const creator = req.user;
+    const connection = await db.getConnection();
+
+    try {
+        await connection.beginTransaction();
+        const [creatorData] = await connection.query('SELECT * FROM users WHERE id = ?', [creator.id]);
+        const creatorLimits = creatorData[0];
+        const [targetRole] = await connection.query('SELECT name FROM roles WHERE id = ?', [role_id]);
+        const isCreatingAgent = targetRole[0].name === 'Agent';
+        const isCreatingAdmin = targetRole[0].name === 'Admin' || targetRole[0].name === 'Sub-Admin';
+        
+        const [childCounts] = await connection.query(`SELECT SUM(CASE WHEN r.name = 'Agent' THEN 1 ELSE 0 END) as agent_count, SUM(CASE WHEN r.name IN ('Admin', 'Sub-Admin') THEN 1 ELSE 0 END) as admin_count FROM users u JOIN user_roles ur ON u.id = ur.user_id JOIN roles r ON ur.role_id = r.id WHERE u.created_by = ?`, [creator.id]);
+
+        if (isCreatingAgent && childCounts[0].agent_count >= creatorLimits.max_agents) {
+            await connection.rollback();
+            return res.status(403).json({ message: `Maximum agent accounts reached (${creatorLimits.max_agents}).` });
+        }
+        
+        if (isCreatingAdmin && childCounts[0].admin_count >= creatorLimits.max_admins) {
+            await connection.rollback();
+            return res.status(403).json({ message: `Maximum admin accounts reached (${creatorLimits.max_admins}).` });
+        }
+
+        const hashedPassword = await bcrypt.hash(password, saltRounds);
+        const [newUserResult] = await connection.query('INSERT INTO users (username, password, branch_id, created_by) VALUES (?, ?, ?, ?)', [username, hashedPassword, branch_id, creator.id]);
+        const newUserId = newUserResult.insertId;
+        
+        await connection.query('INSERT INTO user_roles (user_id, role_id) VALUES (?, ?)', [newUserId, role_id]);
+
+        if (permissions && permissions.length > 0) {
+            const permissionValues = permissions.map(permId => [newUserId, permId]);
+            await connection.query('INSERT INTO user_specific_permissions (user_id, permission_id) VALUES ?', [permissionValues]);
+        }
+        
+        await connection.commit();
+        res.status(201).json({ message: 'User created successfully.' });
+    } catch (error) {
+        await connection.rollback();
+        if (error.code === 'ER_DUP_ENTRY') return res.status(409).json({ message: 'Username already exists.' });
+        console.error("User Registration Error:", error);
+        res.status(500).json({ message: 'Failed to create user.' });
+    } finally {
+        connection.release();
+    }
+});
+
+
+app.get('/api/roles', verifyToken, hasPermission('manage_users'), async (req, res) => {
+    try {
+        let query = "SELECT * FROM roles";
+        if (req.user.role === 'Super Admin') {
+            query += " WHERE name = 'Admin'";
+        } else {
+            query += " WHERE name IN ('Sub-Admin', 'Agent')";
+        }
+        const [roles] = await db.query(query);
+        res.json(roles);
+    } catch (error) {
+        console.error("Error fetching roles:", error);
+        res.status(500).json({ message: 'Failed to fetch roles.' });
+    }
+});
+
+app.get('/api/permissions', verifyToken, hasPermission('manage_users'), async (req, res) => {
+    try {
+        const query = `SELECT * FROM permissions WHERE name NOT IN ('manage_users', 'manage_branches')`;
+        const [permissions] = await db.query(query);
+        res.json(permissions);
+    } catch (error) {
+        console.error("Error fetching permissions:", error);
+        res.status(500).json({ message: 'Failed to fetch permissions.' });
+    }
+});
+
+app.post('/api/users/:id/limits', verifyToken, hasPermission('manage_users'), async (req, res) => {
+    const { max_agents, max_admins } = req.body;
+    const userIdToUpdate = req.params.id;
+    try {
+        await db.query('UPDATE users SET max_agents = ?, max_admins = ? WHERE id = ?', [max_agents, max_admins, userIdToUpdate]);
+        res.json({ message: 'User limits updated successfully.' });
+    } catch (error) {
+        console.error("Error setting user limits:", error);
+        res.status(500).json({ message: 'Failed to update user limits.' });
+    }
+});
+
+
+app.get('/api/agents', verifyToken, hasPermission('manage_customers'), async (req, res) => {
+    try {
+        const query = `SELECT u.id, u.username FROM users u JOIN user_roles ur ON u.id = ur.user_id WHERE ur.role_id = (SELECT id FROM roles WHERE name = 'Agent')`; 
+        const [agents] = await db.query(query);
+        res.json(agents);
+    } catch (error) {
+        console.error("Error fetching agents:", error);
+        res.status(500).json({ message: 'Failed to fetch agents.' });
+    }
+});
+
+
+// ## CUSTOMER MANAGEMENT ##
+app.get('/api/customers', verifyToken, hasPermission('manage_customers'), async (req, res) => {
+    try {
+        const query = `SELECT c.*, u.username as agent_name, d.name as price_level_name, b.name as branch_name FROM customers c LEFT JOIN users u ON c.agent_id = u.id LEFT JOIN discounts d ON c.price_level_id = d.id LEFT JOIN branches b ON c.branch_id = b.id WHERE c.branch_id = ? ORDER BY c.name`;
+        const [customers] = await db.query(query, [req.user.branch_id]);
+        res.json(customers);
+    } catch (error) {
+        console.error("Error fetching customers:", error);
+        res.status(500).json({ message: 'Failed to fetch customers.' });
+    }
+});
+
+app.get('/api/customers/:customerId/check-pending', verifyToken, hasPermission('use_pos'), async (req, res) => {
+    const { customerId } = req.params;
+    try {
+        const query = `SELECT id, invoice_no FROM orders WHERE customer_id = ? AND payment_status = 'Unpaid' AND status != 'Cancelled' LIMIT 1`;
+        const [unpaidOrders] = await db.query(query, [customerId]);
+        if (unpaidOrders.length > 0) {
+            res.json({ has_pending: true, order_info: unpaidOrders[0] });
+        } else {
+            res.json({ has_pending: false, order_info: null });
+        }
+    } catch (error) {
+        console.error("Error checking pending customer payments:", error);
+        res.status(500).json({ message: 'Failed to check pending payments.' });
+    }
+});
+
+app.post('/api/customers', verifyToken, hasPermission('manage_customers'), async (req, res) => {
+    const { name, address, agent_id, contact_number_1, contact_number_2, payment_terms, price_level_id, freight_duration, credit_limit } = req.body;
+    if (!name) return res.status(400).json({ message: "Customer name is required." });
+    const branch_id = req.user.branch_id;
+    if (!branch_id) return res.status(400).json({ message: "Your account is not assigned to a branch." });
+
+    const customer_code = `CUST-${Date.now()}`;
+    try {
+        await db.query(`INSERT INTO customers (customer_code, name, address, agent_id, contact_number_1, contact_number_2, payment_terms, price_level_id, freight_duration, credit_limit, branch_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [customer_code, name, address || null, agent_id || null, contact_number_1 || null, contact_number_2 || null, payment_terms || 30, price_level_id || null, freight_duration || 5, credit_limit || 0, branch_id]);
+        res.status(201).json({ message: "Customer registered successfully." });
+    } catch (error) {
+        console.error("Error registering customer:", error);
+        res.status(500).json({ message: "Failed to register customer due to a server error." });
+    }
+});
+
+// ## PRICING ENGINE ##
+app.post('/api/pricing/calculate', verifyToken, hasPermission('use_pos'), async (req, res) => {
+    const { cart, customer_id } = req.body;
+    if (!cart || cart.length === 0) return res.json([]);
+    try {
+        let customerPriceLevelId = null;
+        if (customer_id) {
+            const [customer] = await db.query('SELECT price_level_id FROM customers WHERE id = ?', [customer_id]);
+            if (customer.length > 0) customerPriceLevelId = customer[0].price_level_id;
+        }
+
+        const [discounts] = await db.query('SELECT * FROM discounts WHERE is_active = TRUE');
+        
+        const pricedCart = cart.map(item => {
+            let finalPrice = parseFloat(item.price);
+            let appliedDiscount = null;
+
+            if (item.discount && parseFloat(item.discount) > 0) {
+                finalPrice -= parseFloat(item.discount);
+                appliedDiscount = { name: `Manual Discount` };
+            } 
+            else if (customerPriceLevelId) {
+                const customerDiscount = discounts.find(d => d.id === customerPriceLevelId);
+                if (customerDiscount) {
+                    if (customerDiscount.type === 'PERCENTAGE') finalPrice *= (1 - customerDiscount.value / 100);
+                    else finalPrice -= customerDiscount.value;
+                    appliedDiscount = customerDiscount;
+                }
+            }
+            
+            return { ...item, originalPrice: parseFloat(item.price), finalPrice: Math.max(0, finalPrice), appliedDiscount };
+        });
+
+        res.json(pricedCart);
+    } catch (error) {
+        console.error("Pricing calculation error:", error);
+        res.status(500).json({ message: 'Error calculating prices.' });
+    }
+});
+
+
+// ## PRODUCT MANAGEMENT ##
+app.get('/api/products', verifyToken, hasPermission(['manage_products', 'use_pos']), async (req, res) => {
+    const { page = 0, pageSize = 100, search = '' } = req.query;
+    const offset = parseInt(page, 10) * parseInt(pageSize, 10);
+    let whereClauses = ['p.is_active = TRUE'];
+    const queryParams = [];
+    if (search) {
+        whereClauses.push(`(p.name LIKE ? OR p.category LIKE ?)`);
+        queryParams.push(`%${search}%`, `%${search}%`);
+    }
+    const whereString = `WHERE ${whereClauses.join(' AND ')}`;
+    const dataQuery = `SELECT p.*, pa.name as partner_name, COALESCE(i.stock_quantity, 0) as stock FROM products p LEFT JOIN inventory i ON p.id = i.product_id LEFT JOIN partners pa ON p.partner_id = pa.id ${whereString} ORDER BY p.name LIMIT ? OFFSET ?`;
+    const [products] = await db.query(dataQuery, [...queryParams, parseInt(pageSize, 10), offset]);
+    const countQuery = `SELECT COUNT(p.id) as total FROM products p ${whereString}`;
+    const [totalRows] = await db.query(countQuery, queryParams);
+    res.json({
+        rows: products.map(p => ({ ...p, price: parseFloat(p.price) })),
+        rowCount: totalRows[0].total
+    });
+});
+
+app.post('/api/products', verifyToken, hasPermission('manage_products'), upload.single('image'), async (req, res) => {
+    const { name, description, price, partner_id, category, unit } = req.body;
+    const imageUrl = req.file ? `/${req.file.path.replace(/\\/g, "/")}` : null;
+
+    if (!name || !price) {
+        return res.status(400).json({ message: 'Product name and price are required.' });
+    }
+
+    const connection = await db.getConnection();
+    try {
+        await connection.beginTransaction();
+
+        const [productResult] = await connection.query('INSERT INTO products (name, description, price, partner_id, category, unit, image_url) VALUES (?, ?, ?, ?, ?, ?, ?)', [name, description || null, price, partner_id || null, category || null, unit || 'pcs', imageUrl]);
+        const newProductId = productResult.insertId;
+
+        await connection.query('INSERT INTO inventory (product_id, stock_quantity) VALUES (?, ?)', [newProductId, 0]);
+
+        await connection.commit();
+        res.status(201).json({ message: 'Product created successfully.' });
+    } catch (error) {
+        await connection.rollback();
+        console.error("Error creating product:", error);
         res.status(500).json({ message: 'Failed to create product.' });
     } finally {
         connection.release();
     }
 });
 
-app.put('/api/products/:id', verifyToken, hasPermission(['products']), upload.single('image'), async (req, res) => {
-    const { id } = req.params;
-    const { name, description, price } = req.body;
-    
+
+// ## INVENTORY MANAGEMENT ##
+app.get('/api/inventory', verifyToken, hasPermission('manage_inventory'), async (req, res) => {
     try {
-        let updateQuery = 'UPDATE products SET name = ?, description = ?, price = ?';
-        let params = [name, description || '', parseFloat(price)];
-        
-        if (req.file) {
-            updateQuery += ', image_url = ?';
-            params.push(`/uploads/${req.file.filename}`);
-        }
-        
-        updateQuery += ' WHERE id = ?';
-        params.push(id);
-        
-        await db.query(updateQuery, params);
-        res.json({ message: 'Product updated successfully.' });
+        const query = `SELECT p.id as product_id, p.name, p.category, pa.name as partner_name, i.stock_quantity, CASE WHEN i.stock_quantity <= 0 THEN 'Out of Stock' WHEN i.stock_quantity <= 10 THEN 'Low Stock' ELSE 'In Stock' END as status FROM products p JOIN inventory i ON p.id = i.product_id LEFT JOIN partners pa ON p.partner_id = pa.id ORDER BY p.name`;
+        const [inventory] = await db.query(query);
+        res.json(inventory);
     } catch (error) {
-        console.error("Update Product Error:", error);
-        res.status(500).json({ message: 'Failed to update product.' });
+        console.error("Error fetching inventory:", error);
+        res.status(500).json({ message: "Failed to fetch inventory." });
     }
 });
 
-app.delete('/api/products/:id', verifyToken, hasPermission(['products']), async (req, res) => {
-    const { id } = req.params;
-    const connection = await db.getConnection();
-    
-    try {
-        await connection.beginTransaction();
-        
-        await connection.query('DELETE FROM inventory WHERE product_id = ?', [id]);
-        
-        await connection.query('DELETE FROM products WHERE id = ?', [id]);
-        
-        await connection.commit();
-        res.json({ message: 'Product deleted successfully.' });
-    } catch (error) {
-        await connection.rollback();
-        console.error("Delete Product Error:", error);
-        if (error.code === 'ER_ROW_IS_REFERENCED_2') {
-             return res.status(400).json({ message: 'Cannot delete product because it is referenced in past orders.' });
-        }
-        res.status(500).json({ message: 'Failed to delete product.' });
-    } finally {
-        connection.release();
-    }
-});
-
-// --- INVENTORY ROUTES ---
-app.get('/api/inventory', verifyToken, hasPermission(['inventory']), async (req, res) => {
-    try {
-        const [items] = await db.query(`
-            SELECT p.id as product_id, p.name, COALESCE(i.stock_quantity, 0) as stock_quantity,
-            CASE
-                WHEN COALESCE(i.stock_quantity, 0) = 0 THEN 'Out of Stock'
-                WHEN COALESCE(i.stock_quantity, 0) <= 10 THEN 'Low Stock'
-                ELSE 'In Stock'
-            END as status
-            FROM products p
-            LEFT JOIN inventory i ON p.id = i.product_id
-            ORDER BY p.name ASC;
-        `);
-        res.json(items);
-    } catch(error) {
-        console.error("Fetch Inventory Error:", error);
-        res.status(500).json({ message: 'Failed to fetch inventory.'});
-    }
-});
-
-app.put('/api/inventory/:productId', verifyToken, hasPermission(['inventory']), async (req, res) => {
+app.put('/api/inventory/:productId', verifyToken, hasPermission('manage_inventory'), async (req, res) => {
     const { productId } = req.params;
     const { newStock } = req.body;
-    
+
     if (newStock === undefined || newStock < 0) {
-        return res.status(400).json({ message: 'Valid stock quantity is required.' });
+        return res.status(400).json({ message: 'A valid new stock quantity is required.' });
     }
-    
+
     try {
-        const [existing] = await db.query('SELECT * FROM inventory WHERE product_id = ?', [productId]);
-        
-        if (existing.length === 0) {
-            await db.query('INSERT INTO inventory (product_id, stock_quantity) VALUES (?, ?)', [productId, newStock]);
-        } else {
-            await db.query('UPDATE inventory SET stock_quantity = ? WHERE product_id = ?', [newStock, productId]);
-        }
-        
+        await db.query('UPDATE inventory SET stock_quantity = ? WHERE product_id = ?', [newStock, productId]);
         res.json({ message: 'Stock updated successfully.' });
     } catch (error) {
-        console.error("Update Stock Error:", error);
-        res.status(500).json({ message: 'Failed to update stock.' });
+        console.error("Error updating stock:", error);
+        res.status(500).json({ message: 'Failed to update stock quantity.' });
     }
 });
 
-// --- ORDER ROUTES ---
-app.post('/api/orders', verifyToken, hasPermission(['pos']), async (req, res) => {
-    const { cart, totalAmount, customerName, discount, officialReceiptNo, source } = req.body;
-    const agentId = req.user.id;
-    if (!cart || cart.length === 0) return res.status(400).json({ message: 'Cart cannot be empty.' });
+
+// ## DISCOUNT MANAGEMENT ##
+app.get('/api/discounts', verifyToken, hasPermission(['manage_discounts', 'manage_customers', 'use_pos']), async (req, res) => {
+    try {
+        const [discounts] = await db.query('SELECT * FROM discounts ORDER BY name');
+        res.json(discounts);
+    } catch (error) {
+        console.error("Error fetching discounts:", error);
+        res.status(500).json({ message: "Failed to fetch discounts." });
+    }
+});
+
+app.post('/api/discounts/advanced', verifyToken, hasPermission('manage_discounts'), async (req, res) => {
+    const { name, type, value, assignments } = req.body;
+    if (!name || !type || !value) return res.status(400).json({ message: "Name, type, and value are required." });
 
     const connection = await db.getConnection();
     try {
         await connection.beginTransaction();
-        
-        const [orderResult] = await connection.query(
-            'INSERT INTO orders (agent_id, total_amount, customer_name, discount, source, status, payment_status, official_receipt_no) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-            [agentId, totalAmount, customerName || 'Walk-in', discount || 0, source || 'pos', 'Completed', 'Paid', officialReceiptNo]
-        );
-        const orderId = orderResult.insertId;
 
-        for (const item of cart) {
-            await connection.query(
-                'INSERT INTO order_items (order_id, product_id, quantity, price_per_unit) VALUES (?, ?, ?, ?)', 
-                [orderId, item.id, item.quantity, item.price]
-            );
-            
-            const [stock] = await connection.query('SELECT stock_quantity FROM inventory WHERE product_id = ? FOR UPDATE', [item.id]);
-            if (stock.length === 0 || stock[0].stock_quantity < item.quantity) {
-                throw new Error(`Insufficient stock for product: ${item.name}`);
-            }
-            await connection.query('UPDATE inventory SET stock_quantity = stock_quantity - ? WHERE product_id = ?', [item.quantity, item.id]);
+        const [discountResult] = await connection.query('INSERT INTO discounts (name, type, value) VALUES (?, ?, ?)', [name, type, value]);
+        const discountId = discountResult.insertId;
+
+        if (assignments && assignments.length > 0) {
+            const assignmentValues = assignments.map(a => [discountId, a.id]);
+            await connection.query('INSERT INTO discount_product_assignments (discount_id, product_id) VALUES ?', [assignmentValues]);
         }
-
+        
         await connection.commit();
-        res.status(201).json({ message: 'Order created successfully!', orderId });
+        res.status(201).json({ message: 'Advanced discount rule created successfully.' });
     } catch (error) {
         await connection.rollback();
-        console.error("Create Order Error:", error);
-        res.status(500).json({ message: error.message || 'Failed to create order.' });
+        console.error("Error creating advanced discount:", error);
+        res.status(500).json({ message: 'Failed to create discount rule.' });
     } finally {
         connection.release();
     }
 });
 
-// --- Corrected and Enhanced Order Fetching Route ---
-// This version adds detailed logging to help pinpoint the exact error.
-app.get('/api/orders', verifyToken, hasPermission(['orders']), async (req, res) => {
+// ## PARTNER MANAGEMENT ##
+app.get('/api/partners', verifyToken, hasPermission('manage_products'), async (req, res) => {
     try {
-        console.log("Attempting to fetch orders from the database...");
-
-        // This query explicitly lists columns to be more stable.
-        const query = `
-            SELECT
-                o.id,
-                o.agent_id,
-                o.total_amount,
-                o.customer_name,
-                o.discount,
-                o.source,
-                o.status,
-                o.payment_status,
-                o.official_receipt_no,
-                o.order_date,
-                COALESCE(u.username, 'N/A') as agent_name
-            FROM
-                orders o
-            LEFT JOIN
-                users u ON o.agent_id = u.id
-            ORDER BY
-                o.order_date DESC
-        `;
-        const [orders] = await db.query(query);
-        console.log(`Successfully fetched ${orders.length} orders from the database.`);
-
-        const mappedOrders = orders.map(o => ({
-            ...o,
-            total_amount: parseFloat(o.total_amount),
-            discount: parseFloat(o.discount || 0)
-        }));
-
-        res.json(mappedOrders);
-
+        const [partners] = await db.query('SELECT * FROM partners ORDER BY name');
+        res.json(partners);
     } catch (error) {
-        // This will print a very detailed error message in your server's terminal
-        console.error("--- DATABASE ERROR in GET /api/orders ---");
-        console.error("Timestamp:", new Date().toISOString());
-        console.error("Error Code:", error.code);
-        console.error("Error Message:", error.message);
-        console.error("--- END DATABASE ERROR ---");
-        res.status(500).json({ message: "Failed to fetch orders. Check server logs for details." });
+        console.error("Error fetching partners:", error);
+        res.status(500).json({ message: 'Failed to fetch partners.' });
     }
 });
 
-app.get('/api/orders/:id', verifyToken, hasPermission(['orders']), async (req, res) => {
+app.post('/api/partners', verifyToken, hasPermission('manage_products'), async (req, res) => {
+    const { name } = req.body;
+    if (!name || name.trim() === '') return res.status(400).json({ message: 'Partner name is required.' });
+    try {
+        await db.query('INSERT INTO partners (name) VALUES (?)', [name.trim()]);
+        res.status(201).json({ message: 'Partner created successfully.' });
+    } catch (error) {
+        if (error.code === 'ER_DUP_ENTRY') return res.status(409).json({ message: 'A partner with this name already exists.' });
+        res.status(500).json({ message: 'Failed to create partner.' });
+    }
+});
+
+
+// ## ORDER MANAGEMENT ##
+app.get('/api/orders', verifyToken, hasPermission('manage_orders'), async (req, res) => {
+    try {
+        let query = `SELECT o.*, c.name as customer_name, u.username as agent_name FROM orders o JOIN customers c ON o.customer_id = c.id JOIN users u ON o.agent_id = u.id WHERE o.status NOT IN ('Delivered', 'Completed', 'Cancelled')`;
+        const queryParams = [];
+        if (req.user.branch_id) {
+            query += ` AND o.branch_id = ?`;
+            queryParams.push(req.user.branch_id);
+        }
+        query += ' ORDER BY o.order_date DESC';
+        const [orders] = await db.query(query, queryParams);
+        res.json(orders);
+    } catch (error) {
+        console.error("Error fetching active orders:", error);
+        res.status(500).json({ message: "Failed to fetch active orders." });
+    }
+});
+
+app.get('/api/orders/:id', verifyToken, hasPermission(['manage_orders', 'use_pos']), async (req, res) => {
     const { id } = req.params;
     try {
-        const [orderQuery] = await db.query(`
-            SELECT o.*, u.username as agent_name
-            FROM orders o
-            LEFT JOIN users u ON o.agent_id = u.id
-            WHERE o.id = ?
-        `, [id]);
+        const orderQuery = `SELECT o.*, c.name as customer_name, u.username as agent_name FROM orders o JOIN customers c ON o.customer_id = c.id JOIN users u ON o.agent_id = u.id WHERE o.id = ?`;
+        const [orders] = await db.query(orderQuery, [id]);
         
-        if (orderQuery.length === 0) {
+        if (orders.length === 0) {
             return res.status(404).json({ message: 'Order not found.' });
         }
+
+        const itemsQuery = `SELECT oi.*, p.name FROM order_items oi JOIN products p ON oi.product_id = p.id WHERE oi.order_id = ?`;
+        const [items] = await db.query(itemsQuery, [id]);
         
-        const [itemsQuery] = await db.query(`
-            SELECT oi.*, p.name
-            FROM order_items oi
-            JOIN products p ON oi.product_id = p.id
-            WHERE oi.order_id = ?
-        `, [id]);
-        
-        const order = {
-            ...orderQuery[0],
-            total_amount: parseFloat(orderQuery[0].total_amount),
-            discount: parseFloat(orderQuery[0].discount || 0),
-            items: itemsQuery.map(item => ({
-                ...item,
-                price_per_unit: parseFloat(item.price_per_unit)
-            }))
-        };
-        
-        res.json(order);
+        const orderDetails = { ...orders[0], items: items };
+        res.json(orderDetails);
     } catch (error) {
-        console.error("Fetch Order Details Error:", error);
+        console.error("Error fetching order details:", error);
         res.status(500).json({ message: "Failed to fetch order details." });
     }
 });
 
-app.put('/api/orders/:id/status', verifyToken, hasPermission(['orders']), async (req, res) => {
+
+app.post('/api/orders', verifyToken, hasPermission('use_pos'), async (req, res) => {
+    const { customer, cart, payment_type, source } = req.body;
+    const agentId = req.user.id;
+    const branchId = req.user.branch_id;
+
+    if (!customer || !cart || cart.length === 0) {
+        return res.status(400).json({ message: 'Customer and cart information are required.' });
+    }
+
+    const connection = await db.getConnection();
+    try {
+        await connection.beginTransaction();
+        
+        let customerId = customer.id;
+        if (!customerId) {
+            const customer_code = `CUST-${Date.now()}`;
+            const [newCustomer] = await connection.query(`INSERT INTO customers (customer_code, name, address, contact_number_1, agent_id, branch_id) VALUES (?, ?, ?, ?, ?, ?)`, [customer_code, customer.name, customer.address || null, customer.contact_number_1 || null, agentId, branchId]);
+            customerId = newCustomer.insertId;
+        }
+
+        const total_amount = cart.reduce((sum, item) => sum + (item.price * item.quantity), 0);
+        const total_discount = cart.reduce((sum, item) => sum + ((item.discount_per_unit || 0) * item.quantity), 0);
+        const final_amount = total_amount - total_discount;
+
+        const payment_status = payment_type === 'COD' ? 'Paid' : 'Unpaid';
+        const [orderResult] = await connection.query(`INSERT INTO orders (agent_id, customer_id, total_amount, discount, source, payment_status, branch_id) VALUES (?, ?, ?, ?, ?, ?, ?)`, [agentId, customerId, final_amount, total_discount, source || 'pos', payment_status, branchId]);
+        const orderId = orderResult.insertId;
+
+        for (const item of cart) {
+            await connection.query('INSERT INTO order_items (order_id, product_id, quantity, price_per_unit, discount_per_unit) VALUES (?, ?, ?, ?, ?)', [orderId, item.id, item.quantity, item.price, item.discount_per_unit || 0]);
+            await connection.query('UPDATE inventory SET stock_quantity = stock_quantity - ? WHERE product_id = ?', [item.quantity, item.id]);
+        }
+
+        await connection.commit();
+        res.status(201).json({ message: 'Order created successfully.', orderId: orderId });
+    } catch (error) {
+        await connection.rollback();
+        console.error("Error creating order:", error);
+        res.status(500).json({ message: "Failed to create order." });
+    } finally {
+        connection.release();
+    }
+});
+
+app.put('/api/orders/:id/invoice', verifyToken, hasPermission('manage_orders'), async (req, res) => {
     const { id } = req.params;
+    const { invoiceNo } = req.body;
+
+    if (!invoiceNo) {
+        return res.status(400).json({ message: "Invoice number is required." });
+    }
+
+    try {
+        await db.query(`UPDATE orders SET invoice_no = ?, status = 'Printing' WHERE id = ?`, [invoiceNo, id]);
+        res.json({ message: "Invoice number saved and status updated." });
+    } catch (error) {
+        console.error("Error saving invoice:", error);
+        res.status(500).json({ message: "Failed to save invoice." });
+    }
+});
+
+
+app.put('/api/orders/:orderId/status', verifyToken, hasPermission(['use_pos', 'manage_orders']), async (req, res) => {
+    const { orderId } = req.params;
     const { status } = req.body;
     
-    const validStatuses = ['Pending', 'Confirmed', 'Preparing', 'Out for Delivery', 'Completed', 'Cancelled'];
-    if (!validStatuses.includes(status)) {
-        return res.status(400).json({ message: 'Invalid status.' });
-    }
-    
+    if (!status) return res.status(400).json({ message: 'New status is required.' });
+
     try {
-        await db.query('UPDATE orders SET status = ? WHERE id = ?', [status, id]);
-        res.json({ message: 'Order status updated successfully.' });
+        await db.query('UPDATE orders SET status = ? WHERE id = ?', [status, orderId]);
+        res.json({ message: `Order #${orderId} status updated to ${status}.` });
     } catch (error) {
-        console.error("Update Order Status Error:", error);
+        console.error("Error updating order status:", error);
         res.status(500).json({ message: 'Failed to update order status.' });
     }
 });
 
-// --- REPORTING ROUTES ---
-app.get('/api/sales/summary', verifyToken, hasPermission(['dashboard']), async (req, res) => {
-    try {
-        const [summary] = await db.query(`
-            SELECT 
-                COALESCE(SUM(total_amount), 0) as totalRevenue,
-                COUNT(id) as totalOrders
-            FROM orders 
-            WHERE order_date >= CURDATE() - INTERVAL 7 DAY AND status = 'Completed';
-        `);
-        
-        const [dailySales] = await db.query(`
-            SELECT 
-                DATE_FORMAT(order_date, '%a') as day,
-                COALESCE(SUM(total_amount), 0) as sales
-            FROM orders 
-            WHERE order_date >= CURDATE() - INTERVAL 7 DAY AND status = 'Completed'
-            GROUP BY DATE(order_date), DATE_FORMAT(order_date, '%a')
-            ORDER BY DATE(order_date);
-        `);
-        
-        const [topProducts] = await db.query(`
-            SELECT p.name, SUM(oi.quantity) as total_quantity
-            FROM order_items oi
-            JOIN products p ON oi.product_id = p.id
-            JOIN orders o ON o.id = oi.order_id
-            WHERE o.order_date >= CURDATE() - INTERVAL 30 DAY AND o.status = 'Completed'
-            GROUP BY p.name
-            ORDER BY total_quantity DESC
-            LIMIT 5;
-        `);
 
-        const weekDays = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-        const salesData = new Map(dailySales.map(d => [d.day, parseFloat(d.sales)]));
-        const salesByDay = weekDays.map(day => salesData.get(day) || 0);
+app.put('/api/orders/:orderId/edit', verifyToken, hasPermission('use_pos'), async (req, res) => {
+    const { orderId } = req.params;
+    const { cart } = req.body;
+    const agentId = req.user.id;
+    const connection = await db.getConnection();
+
+    try {
+        await connection.beginTransaction();
+
+        const [order] = await connection.query('SELECT * FROM orders WHERE id = ?', [orderId]);
+        if (order.length === 0 || order[0].agent_id !== agentId) {
+            await connection.rollback();
+            return res.status(403).json({ message: 'Forbidden: You can only edit your own orders.' });
+        }
+        if (order[0].status !== 'Pending') {
+            await connection.rollback();
+            return res.status(403).json({ message: 'Order can no longer be edited.' });
+        }
+
+        await connection.query('DELETE FROM order_items WHERE order_id = ?', [orderId]);
+        
+        let total_amount = 0;
+        const orderItems = cart.map(item => {
+            const itemTotal = parseFloat(item.price) * item.quantity;
+            total_amount += itemTotal;
+            return [orderId, item.id, item.quantity, item.price, 0];
+        });
+        await connection.query('INSERT INTO order_items (order_id, product_id, quantity, price_per_unit, discount_per_unit) VALUES ?', [orderItems]);
+
+        await connection.query('UPDATE orders SET total_amount = ? WHERE id = ?', [total_amount, orderId]);
+
+        await connection.commit();
+        res.json({ message: `Order #${orderId} has been updated successfully.` });
+    } catch (error) {
+        await connection.rollback();
+        console.error("Error editing order:", error);
+        res.status(500).json({ message: 'Failed to edit order.' });
+    } finally {
+        connection.release();
+    }
+});
+
+
+app.get('/api/order-history', verifyToken, hasPermission('manage_orders'), async (req, res) => {
+    try {
+        let query = `SELECT o.*, c.name as customer_name, u.username as agent_name FROM orders o JOIN customers c ON o.customer_id = c.id JOIN users u ON o.agent_id = u.id WHERE o.status IN ('Delivered', 'Completed', 'Cancelled')`;
+        const queryParams = [];
+        if (req.user.branch_id) {
+            query += ` AND o.branch_id = ?`;
+            queryParams.push(req.user.branch_id);
+        }
+        query += ' ORDER BY o.order_date DESC';
+        const [orders] = await db.query(query, queryParams);
+        res.json(orders);
+    } catch (error) {
+        console.error("Error fetching order history:", error);
+        res.status(500).json({ message: "Failed to fetch order history." });
+    }
+});
+
+
+// ## ACCOUNTING ##
+app.get('/api/accounting/unpaid', verifyToken, hasPermission('manage_accounting'), async (req, res) => {
+    try {
+        let query = `SELECT o.*, c.name as customer_name, u.username as agent_name FROM orders o JOIN customers c ON o.customer_id = c.id JOIN users u ON o.agent_id = u.id WHERE o.payment_status = 'Unpaid'`;
+        const queryParams = [];
+        if (req.user.branch_id) {
+            query += ` AND o.branch_id = ?`;
+            queryParams.push(req.user.branch_id);
+        }
+        query += ' ORDER BY o.order_date ASC';
+        const [orders] = await db.query(query, queryParams);
+        res.json(orders);
+    } catch (error) {
+        console.error("Error fetching unpaid orders:", error);
+        res.status(500).json({ message: "Failed to fetch unpaid orders." });
+    }
+});
+
+app.post('/api/accounting/mark-paid/:orderId', verifyToken, hasPermission('manage_accounting'), async (req, res) => {
+    const { orderId } = req.params;
+    const { password } = req.body;
+    const adminUserId = req.user.id;
+
+    if (!password) {
+        return res.status(400).json({ message: "Password is required for authorization." });
+    }
+
+    try {
+        const [adminUser] = await db.query('SELECT password FROM users WHERE id = ?', [adminUserId]);
+        if (adminUser.length === 0) {
+            return res.status(401).json({ message: "Unauthorized." });
+        }
+        const isPasswordMatch = await bcrypt.compare(password, adminUser[0].password);
+        if (!isPasswordMatch) {
+            return res.status(403).json({ message: "Invalid password. Authorization failed." });
+        }
+
+        await db.query(`UPDATE orders SET payment_status = 'Paid', status = 'Completed' WHERE id = ?`, [orderId]);
+        res.json({ message: "Order successfully marked as paid." });
+
+    } catch (error) {
+        console.error("Error marking order as paid:", error);
+        res.status(500).json({ message: "Failed to mark order as paid." });
+    }
+});
+
+
+// ## DASHBOARD & REPORTING ##
+app.get('/api/sales/summary', verifyToken, hasPermission('view_dashboard'), async (req, res) => {
+    const { period = 'weekly' } = req.query;
+    const user = req.user;
+    let intervalClause, dateFormat;
+
+    switch (period) {
+        case 'monthly': intervalClause = 'INTERVAL 1 MONTH'; dateFormat = '%Y-%m-%d'; break;
+        case 'daily': intervalClause = 'INTERVAL 24 HOUR'; dateFormat = '%l %p'; break;
+        default: intervalClause = 'INTERVAL 7 DAY'; dateFormat = '%a'; break;
+    }
+
+    try {
+        let branchFilter = '';
+        const queryParams = [];
+        if (user.branch_id) {
+            branchFilter = `AND branch_id = ?`;
+            queryParams.push(user.branch_id);
+        }
+
+        const summaryQuery = `SELECT COALESCE(SUM(CASE WHEN status != 'Cancelled' THEN total_amount ELSE 0 END), 0) as totalRevenue, COUNT(id) as totalOrders FROM orders WHERE order_date >= CURDATE() - ${intervalClause} ${branchFilter}`;
+        const [summaryResult] = await db.query(summaryQuery, queryParams);
+
+        const dailySalesQuery = `SELECT DATE_FORMAT(order_date, ?) as day, COALESCE(SUM(total_amount), 0) as sales FROM orders WHERE order_date >= CURDATE() - ${intervalClause} AND status != 'Cancelled' ${branchFilter} GROUP BY day ORDER BY MIN(order_date)`;
+        const [dailySalesResult] = await db.query(dailySalesQuery, [dateFormat, ...queryParams]);
+
+        const topProductsQuery = `SELECT p.name, SUM(oi.quantity) as total_quantity FROM order_items oi JOIN products p ON oi.product_id = p.id JOIN orders o ON o.id = oi.order_id WHERE o.status != 'Cancelled' AND o.order_date >= CURDATE() - INTERVAL 30 DAY ${branchFilter} GROUP BY p.name ORDER BY total_quantity DESC LIMIT 10`;
+        const [topProductsResult] = await db.query(topProductsQuery, queryParams);
+
+        const salesData = { labels: dailySalesResult.map(d => d.day), data: dailySalesResult.map(d => parseFloat(d.sales)) };
 
         res.json({
-            summary: {
-                totalRevenue: parseFloat(summary[0].totalRevenue || 0),
-                totalOrders: summary[0].totalOrders || 0
-            },
-            dailySales: { labels: weekDays, data: salesByDay },
-            topProducts: topProducts || []
+            summary: { totalRevenue: parseFloat(summaryResult[0].totalRevenue || 0), totalOrders: summaryResult[0].totalOrders || 0 },
+            dailySales: salesData,
+            topProducts: topProductsResult || []
         });
     } catch (error) {
-        console.error("Sales summary error:", error);
+        console.error("Sales Summary Error:", error);
         res.status(500).json({ message: "Failed to fetch sales summary." });
     }
 });
 
-// --- FIX EXISTING PERMISSIONS DATA ---
-const fixExistingPermissions = async () => {
-    try {
-        console.log('Checking and fixing existing permissions data...');
-        
-        const [users] = await db.query('SELECT id, username, permissions FROM users');
-        
-        for (const user of users) {
-            const currentPermissions = user.permissions;
-            const parsedPermissions = parsePermissions(currentPermissions);
-            
-            // Only update if the current permissions are invalid JSON or need fixing
-            if (typeof currentPermissions === 'string' && currentPermissions !== JSON.stringify(parsedPermissions)) {
-                await db.query(
-                    'UPDATE users SET permissions = ? WHERE id = ?',
-                    [JSON.stringify(parsedPermissions), user.id]
-                );
-                console.log(`Fixed permissions for user: ${user.username}`);
-            }
-        }
-        
-        console.log('Permissions data check completed.');
-    } catch (error) {
-        console.error('Error fixing permissions data:', error);
+app.get('/api/reports/customer-comparison', verifyToken, hasPermission('view_reports'), async (req, res) => {
+    const { customerId, monthA, monthB } = req.query;
+    if (!customerId || !monthA || !monthB) {
+        return res.status(400).json({ message: 'Customer ID, Month A, and Month B are required.' });
     }
-};
+    try {
+        const query = `
+            SELECT 
+                SUM(CASE WHEN DATE_FORMAT(order_date, '%Y-%m') = ? THEN total_amount ELSE 0 END) as salesMonthA,
+                SUM(CASE WHEN DATE_FORMAT(order_date, '%Y-%m') = ? THEN total_amount ELSE 0 END) as salesMonthB
+            FROM orders
+            WHERE customer_id = ? AND status != 'Cancelled' AND (DATE_FORMAT(order_date, '%Y-%m') = ? OR DATE_FORMAT(order_date, '%Y-%m') = ?)
+        `;
+        const [results] = await db.query(query, [monthA, monthB, customerId, monthA, monthB]);
+        res.json({
+            totalSalesMonthA: parseFloat(results[0].salesMonthA) || 0,
+            totalSalesMonthB: parseFloat(results[0].salesMonthB) || 0,
+        });
+    } catch (error) {
+        console.error("Error generating customer comparison report:", error);
+        res.status(500).json({ message: 'Failed to generate report.' });
+    }
+});
 
-// --- DATABASE INITIALIZATION ---
+
+// --- DATABASE INITIALIZATION SCRIPT ---
 const initializeDatabase = async () => {
     try {
-        await db.query(`
-            CREATE TABLE IF NOT EXISTS users (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                username VARCHAR(50) UNIQUE NOT NULL,
-                password VARCHAR(255) NOT NULL,
-                role ENUM('Super Admin', 'Admin', 'Agent') DEFAULT 'Agent',
-                permissions JSON,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        `);
+        console.log("Verifying and initializing database schema...");
+        
+        await db.query(`CREATE TABLE IF NOT EXISTS branches (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(100) NOT NULL UNIQUE, is_main_branch BOOLEAN DEFAULT FALSE) ENGINE=InnoDB;`);
+        await db.query(`CREATE TABLE IF NOT EXISTS users (id INT AUTO_INCREMENT PRIMARY KEY, username VARCHAR(50) NOT NULL UNIQUE, password VARCHAR(255) NOT NULL, branch_id INT, is_active BOOLEAN DEFAULT TRUE, created_by INT NULL, max_agents INT DEFAULT 5, max_admins INT DEFAULT 1, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (branch_id) REFERENCES branches(id) ON DELETE SET NULL, FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL) ENGINE=InnoDB;`);
+        await db.query(`CREATE TABLE IF NOT EXISTS roles (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(50) NOT NULL UNIQUE) ENGINE=InnoDB;`);
+        await db.query(`CREATE TABLE IF NOT EXISTS permissions (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(100) NOT NULL UNIQUE, description VARCHAR(255)) ENGINE=InnoDB;`);
+        await db.query(`CREATE TABLE IF NOT EXISTS role_permissions (role_id INT NOT NULL, permission_id INT NOT NULL, PRIMARY KEY (role_id, permission_id), FOREIGN KEY (role_id) REFERENCES roles(id) ON DELETE CASCADE, FOREIGN KEY (permission_id) REFERENCES permissions(id) ON DELETE CASCADE) ENGINE=InnoDB;`);
+        await db.query(`CREATE TABLE IF NOT EXISTS user_roles (user_id INT NOT NULL, role_id INT NOT NULL, PRIMARY KEY (user_id, role_id), FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE, FOREIGN KEY (role_id) REFERENCES roles(id) ON DELETE CASCADE) ENGINE=InnoDB;`);
+        await db.query(`CREATE TABLE IF NOT EXISTS user_specific_permissions (user_id INT NOT NULL, permission_id INT NOT NULL, PRIMARY KEY (user_id, permission_id), FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE, FOREIGN KEY (permission_id) REFERENCES permissions(id) ON DELETE CASCADE) ENGINE=InnoDB;`);
+        await db.query(`CREATE TABLE IF NOT EXISTS partners (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(100) NOT NULL UNIQUE) ENGINE=InnoDB;`);
+        await db.query(`CREATE TABLE IF NOT EXISTS products (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(100) NOT NULL, description TEXT, price DECIMAL(10,2) NOT NULL, image_url VARCHAR(255), partner_id INT, category VARCHAR(255), unit VARCHAR(50) DEFAULT 'pcs', is_active BOOLEAN DEFAULT TRUE, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (partner_id) REFERENCES partners(id) ON DELETE SET NULL) ENGINE=InnoDB;`);
+        await db.query(`CREATE TABLE IF NOT EXISTS inventory (id INT AUTO_INCREMENT PRIMARY KEY, product_id INT NOT NULL UNIQUE, stock_quantity INT NOT NULL DEFAULT 0, FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE) ENGINE=InnoDB;`);
+        await db.query(`CREATE TABLE IF NOT EXISTS discounts (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(100) NOT NULL, type ENUM('PERCENTAGE', 'FIXED_AMOUNT', 'COD', 'BUY_GET') NOT NULL, value DECIMAL(10,2) DEFAULT 0, is_active BOOLEAN DEFAULT TRUE, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP) ENGINE=InnoDB;`);
+        await db.query(`CREATE TABLE IF NOT EXISTS discount_product_assignments (discount_id INT NOT NULL, product_id INT NOT NULL, PRIMARY KEY (discount_id, product_id), FOREIGN KEY (discount_id) REFERENCES discounts(id) ON DELETE CASCADE, FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE) ENGINE=InnoDB;`);
+        await db.query(`CREATE TABLE IF NOT EXISTS customers (id INT AUTO_INCREMENT PRIMARY KEY, customer_code VARCHAR(100) NOT NULL UNIQUE, name VARCHAR(255) NOT NULL, address TEXT, agent_id INT, contact_number_1 VARCHAR(50), contact_number_2 VARCHAR(50), payment_terms INT DEFAULT 30, price_level_id INT, freight_duration INT DEFAULT 5, credit_limit DECIMAL(10,2) DEFAULT 0, branch_id INT NOT NULL, FOREIGN KEY (agent_id) REFERENCES users(id) ON DELETE SET NULL, FOREIGN KEY (price_level_id) REFERENCES discounts(id) ON DELETE SET NULL, FOREIGN KEY (branch_id) REFERENCES branches(id) ON DELETE RESTRICT) ENGINE=InnoDB;`);
+        await db.query(`CREATE TABLE IF NOT EXISTS orders (id INT AUTO_INCREMENT PRIMARY KEY, agent_id INT NOT NULL, customer_id INT NOT NULL, total_amount DECIMAL(10,2) NOT NULL, discount DECIMAL(10,2) DEFAULT 0, source ENUM('pos', 'mobile') DEFAULT 'pos', status VARCHAR(50) DEFAULT 'Pending', payment_status ENUM('Paid', 'Unpaid', 'Refunded') DEFAULT 'Unpaid', invoice_no VARCHAR(255), order_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP, branch_id INT NOT NULL, FOREIGN KEY (agent_id) REFERENCES users(id) ON DELETE RESTRICT, FOREIGN KEY (customer_id) REFERENCES customers(id) ON DELETE RESTRICT, FOREIGN KEY (branch_id) REFERENCES branches(id) ON DELETE RESTRICT) ENGINE=InnoDB;`);
+        await db.query(`CREATE TABLE IF NOT EXISTS order_items (id INT AUTO_INCREMENT PRIMARY KEY, order_id INT NOT NULL, product_id INT NOT NULL, quantity INT NOT NULL, price_per_unit DECIMAL(10,2) NOT NULL, discount_per_unit DECIMAL(10,2) DEFAULT 0, FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE, FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE RESTRICT) ENGINE=InnoDB;`);
+        
+        const seedData = async (tableName, data, columns = ['id', 'name']) => {
+            const [rows] = await db.query(`SELECT COUNT(*) as count FROM ${tableName}`);
+            if (rows[0].count > 0) return;
+            console.log(`Seeding ${tableName}...`);
+            const query = `INSERT INTO ${tableName} (${columns.join(', ')}) VALUES ?`;
+            const values = data.map(item => columns.map(col => item[col]));
+            await db.query(query, [values]);
+        };
 
-        await db.query(`
-            CREATE TABLE IF NOT EXISTS products (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                name VARCHAR(100) NOT NULL,
-                description TEXT,
-                price DECIMAL(10,2) NOT NULL,
-                image_url VARCHAR(255),
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        `);
-
-        await db.query(`
-            CREATE TABLE IF NOT EXISTS inventory (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                product_id INT NOT NULL,
-                stock_quantity INT DEFAULT 0,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE
-            )
-        `);
-
-        await db.query(`
-            CREATE TABLE IF NOT EXISTS orders (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                agent_id INT NOT NULL,
-                total_amount DECIMAL(10,2) NOT NULL,
-                customer_name VARCHAR(100),
-                discount DECIMAL(10,2) DEFAULT 0,
-                source ENUM('pos', 'online', 'mobile') DEFAULT 'pos',
-                status ENUM('Pending', 'Confirmed', 'Preparing', 'Out for Delivery', 'Completed', 'Cancelled') DEFAULT 'Pending',
-                payment_status ENUM('Pending', 'Paid', 'Refunded') DEFAULT 'Pending',
-                official_receipt_no VARCHAR(50),
-                order_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (agent_id) REFERENCES users(id)
-            )
-        `);
-
-        await db.query(`
-            CREATE TABLE IF NOT EXISTS order_items (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                order_id INT NOT NULL,
-                product_id INT,
-                quantity INT NOT NULL,
-                price_per_unit DECIMAL(10,2) NOT NULL,
-                FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE,
-                FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE SET NULL
-            )
-        `);
-
-        const [existingAdmin] = await db.query("SELECT id FROM users WHERE role = 'Super Admin' LIMIT 1");
-        if (existingAdmin.length === 0) {
+        await seedData('roles', [{ id: 1, name: 'Super Admin' }, { id: 2, name: 'Admin' }, { id: 3, name: 'Agent' }, { id: 4, name: 'Sub-Admin' }]);
+        await seedData('permissions', [
+            { id: 101, name: 'view_dashboard' }, { id: 102, name: 'use_pos' }, { id: 103, name: 'manage_customers' },
+            { id: 104, name: 'manage_products' }, { id: 105, name: 'manage_inventory' }, { id: 106, name: 'manage_orders' },
+            { id: 107, name: 'manage_discounts' }, { id: 108, name: 'manage_accounting' }, { id: 109, name: 'view_reports' },
+            { id: 201, name: 'manage_users' }, { id: 202, name: 'manage_branches' }
+        ]);
+        
+        const [rolePermsCount] = await db.query(`SELECT COUNT(*) as count FROM role_permissions`);
+        if (rolePermsCount[0].count === 0) {
+            console.log('Seeding role_permissions...');
+            const superAdminPerms = [ [1, 201], [1, 202] ];
+            const adminPerms = [
+                [2, 101], [2, 102], [2, 103], [2, 104], [2, 105], 
+                [2, 106], [2, 107], [2, 108], [2, 109], [2, 201]
+            ];
+            const agentPerms = [[3, 102]];
+            const allLinks = [...superAdminPerms, ...adminPerms, ...agentPerms];
+            await db.query('INSERT INTO role_permissions (role_id, permission_id) VALUES ?', [allLinks]);
+        }
+        
+        const [usersCount] = await db.query("SELECT COUNT(*) as count FROM users");
+        if (usersCount[0].count === 0) {
+            console.log('Creating default Super Admin user...');
             const hashedPassword = await bcrypt.hash('admin123', saltRounds);
-            await db.query(
-                "INSERT INTO users (username, password, role, permissions) VALUES (?, ?, ?, ?)",
-                ['superadmin', hashedPassword, 'Super Admin', JSON.stringify([])]
-            );
-            console.log('Default Super Admin created: username=superadmin, password=admin123');
+            const [newUser] = await db.query("INSERT INTO users (username, password) VALUES (?, ?)", ['superadmin', hashedPassword]);
+            const superAdminId = newUser.insertId;
+            await db.query('INSERT INTO user_roles (user_id, role_id) VALUES (?, 1)', [superAdminId]);
         }
 
-        // Fix any existing permissions data issues
-        await fixExistingPermissions();
-
-        console.log('Database initialized successfully');
+        console.log('Database schema verified and initialized successfully.');
     } catch (error) {
-        console.error('Database initialization error:', error);
+        console.error('FATAL: Database initialization failed:', error);
         process.exit(1);
     }
 };
 
-// Initialize database on startup then start the server
 initializeDatabase().then(() => {
     app.listen(port, () => {
-        console.log(`Bughaw Admin Server is live on http://localhost:${port}`);
+        console.log(`Bughaw Admin Server is live and running on http://localhost:${port}`);
     });
 });
